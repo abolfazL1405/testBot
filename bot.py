@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🤖 Telegram Bot Interactive v4.0 - Fully Interactive Edition
-ربات تعاملی کامل با دستورات، دکمه‌ها و قابلیت‌های پیشرفته
+🤖 Telegram Bot Intelligence Collector v4.0 - Production Server Edition
+Designed for headless server deployment with systemd/Docker support.
 """
 
 import os
@@ -11,6 +11,7 @@ import time
 import signal
 import sqlite3
 import logging
+import argparse
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, List
@@ -40,9 +41,11 @@ class Config:
     log_backup_count: int = 5
     polling_timeout: int = 30
     max_retries: int = 3
+    retry_delay: int = 5
     rate_limit_delay: float = 0.1
     batch_save_size: int = 50
     health_check_interval: int = 300  # 5 minutes
+    
     @classmethod
     def from_env(cls) -> 'Config':
         """Load configuration from environment variables or .env file"""
@@ -81,28 +84,30 @@ class Config:
 # ============================================================================
 
 def setup_logging(config: Config) -> logging.Logger:
-    """Setup production logging"""
+    """Setup production logging with rotation"""
     from logging.handlers import RotatingFileHandler
     
-    logger = logging.getLogger('telegram_bot')
+    logger = logging.getLogger('telegram_collector')
     logger.setLevel(getattr(logging, config.log_level.upper()))
     
     formatter = logging.Formatter(
-        '%(asctime)s | %(levelname)-8s | %(message)s',
+        '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     
+    # File handler with rotation
     log_path = Path(config.log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     
     file_handler = RotatingFileHandler(
         log_path,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        maxBytes=config.log_max_bytes,
+        backupCount=config.log_backup_count,
         encoding='utf-8'
     )
     file_handler.setFormatter(formatter)
@@ -116,7 +121,7 @@ def setup_logging(config: Config) -> logging.Logger:
 # ============================================================================
 
 class DatabaseManager:
-    """SQLite database manager"""
+    """SQLite database manager for persistent storage"""
     
     def __init__(self, db_path: Path, logger: logging.Logger):
         self.db_path = db_path
@@ -128,6 +133,14 @@ class DatabaseManager:
         """Initialize database schema"""
         with self._get_connection() as conn:
             conn.executescript('''
+                CREATE TABLE IF NOT EXISTS updates (
+                    update_id INTEGER PRIMARY KEY,
+                    update_type TEXT,
+                    data TEXT,
+                    timestamp TEXT,
+                    processed BOOLEAN DEFAULT FALSE
+                );
+                
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     first_name TEXT,
@@ -136,10 +149,8 @@ class DatabaseManager:
                     language_code TEXT,
                     is_premium BOOLEAN DEFAULT FALSE,
                     messages_count INTEGER DEFAULT 0,
-                    commands_count INTEGER DEFAULT 0,
                     first_seen TEXT,
-                    last_seen TEXT,
-                    is_admin BOOLEAN DEFAULT FALSE
+                    last_seen TEXT
                 );
                 
                 CREATE TABLE IF NOT EXISTS chats (
@@ -147,32 +158,43 @@ class DatabaseManager:
                     chat_type TEXT,
                     title TEXT,
                     username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
                     messages_count INTEGER DEFAULT 0,
                     first_message TEXT,
                     last_message TEXT
                 );
                 
-                CREATE TABLE IF NOT EXISTS user_stats (
+                CREATE TABLE IF NOT EXISTS chat_users (
+                    chat_id INTEGER,
                     user_id INTEGER,
-                    stat_key TEXT,
-                    stat_value INTEGER DEFAULT 0,
-                    PRIMARY KEY (user_id, stat_key),
+                    PRIMARY KEY (chat_id, user_id),
+                    FOREIGN KEY (chat_id) REFERENCES chats(chat_id),
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 );
                 
-                CREATE TABLE IF NOT EXISTS settings (
+                CREATE TABLE IF NOT EXISTS message_types (
                     user_id INTEGER,
-                    setting_key TEXT,
-                    setting_value TEXT,
-                    PRIMARY KEY (user_id, setting_key),
+                    message_type TEXT,
+                    count INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, message_type),
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 );
+                
+                CREATE TABLE IF NOT EXISTS stats (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_updates_timestamp ON updates(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
+                CREATE INDEX IF NOT EXISTS idx_chats_last_message ON chats(last_message);
             ''')
         self.logger.info(f"✅ Database initialized: {self.db_path}")
     
     @contextmanager
     def _get_connection(self):
-        """Get database connection"""
+        """Get database connection with context management"""
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
@@ -185,118 +207,119 @@ class DatabaseManager:
         finally:
             conn.close()
     
+    def save_update(self, update: Dict):
+        """Save update to database"""
+        update_id = update.get('update_id')
+        update_type = self._get_update_type(update)
+        
+        with self._get_connection() as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO updates (update_id, update_type, data, timestamp, processed) VALUES (?, ?, ?, ?, ?)',
+                (update_id, update_type, json.dumps(update, ensure_ascii=False), datetime.now().isoformat(), True)
+            )
+    
     def save_user(self, user_data: Dict):
-        """Save or update user"""
+        """Save or update user data"""
         user_id = user_data.get('user_id')
         
         with self._get_connection() as conn:
-            existing = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)).fetchone()
+            conn.execute('''
+                INSERT OR REPLACE INTO users 
+                (user_id, first_name, last_name, username, language_code, is_premium, 
+                 messages_count, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id,
+                user_data.get('first_name'),
+                user_data.get('last_name'),
+                user_data.get('username'),
+                user_data.get('language_code'),
+                user_data.get('is_premium', False),
+                user_data.get('messages_count', 0),
+                user_data.get('first_seen'),
+                user_data.get('last_seen'),
+            ))
             
-            if existing:
+            for msg_type, count in user_data.get('message_types', {}).items():
                 conn.execute('''
-                    UPDATE users SET 
-                        first_name = ?, last_name = ?, username = ?, 
-                        language_code = ?, is_premium = ?, messages_count = ?,
-                        last_seen = ?
-                    WHERE user_id = ?
-                ''', (
-                    user_data.get('first_name'),
-                    user_data.get('last_name'),
-                    user_data.get('username'),
-                    user_data.get('language_code'),
-                    user_data.get('is_premium', False),
-                    user_data.get('messages_count', 0),
-                    user_data.get('last_seen'),
-                    user_id
-                ))
-            else:
-                conn.execute('''
-                    INSERT INTO users 
-                    (user_id, first_name, last_name, username, language_code, 
-                     is_premium, messages_count, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    user_id,
-                    user_data.get('first_name'),
-                    user_data.get('last_name'),
-                    user_data.get('username'),
-                    user_data.get('language_code'),
-                    user_data.get('is_premium', False),
-                    user_data.get('messages_count', 0),
-                    user_data.get('first_seen'),
-                    user_data.get('last_seen'),
-                ))
+                    INSERT OR REPLACE INTO message_types (user_id, message_type, count)
+                    VALUES (?, ?, ?)
+                ''', (user_id, msg_type, count))
     
-    def increment_user_stat(self, user_id: int, stat_key: str):
-        """Increment user statistic"""
+    def save_chat(self, chat_data: Dict):
+        """Save or update chat data"""
+        chat_id = chat_data.get('chat_id')
+        
         with self._get_connection() as conn:
             conn.execute('''
-                INSERT INTO user_stats (user_id, stat_key, stat_value)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, stat_key) DO UPDATE SET stat_value = stat_value + 1
-            ''', (user_id, stat_key))
+                INSERT OR REPLACE INTO chats 
+                (chat_id, chat_type, title, username, first_name, last_name,
+                 messages_count, first_message, last_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                chat_id,
+                chat_data.get('type'),
+                chat_data.get('title'),
+                chat_data.get('username'),
+                chat_data.get('first_name'),
+                chat_data.get('last_name'),
+                chat_data.get('messages_count', 0),
+                chat_data.get('first_message'),
+                chat_data.get('last_message'),
+            ))
+            
+            for user_id in chat_data.get('active_users', []):
+                conn.execute('''
+                    INSERT OR IGNORE INTO chat_users (chat_id, user_id)
+                    VALUES (?, ?)
+                ''', (chat_id, user_id))
+    
+    def get_last_update_id(self) -> int:
+        """Get last processed update ID"""
+        with self._get_connection() as conn:
+            result = conn.execute('SELECT MAX(update_id) FROM updates').fetchone()
+            return result[0] if result[0] else 0
     
     def get_user(self, user_id: int) -> Optional[Dict]:
         """Get user by ID"""
         with self._get_connection() as conn:
             row = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)).fetchone()
-            return dict(row) if row else None
+            if row:
+                user = dict(row)
+                msg_types = conn.execute(
+                    'SELECT message_type, count FROM message_types WHERE user_id = ?',
+                    (user_id,)
+                ).fetchall()
+                user['message_types'] = {r[0]: r[1] for r in msg_types}
+                return user
+        return None
     
-    def get_user_stats(self, user_id: int) -> Dict:
-        """Get user statistics"""
+    def get_chat(self, chat_id: int) -> Optional[Dict]:
+        """Get chat by ID"""
         with self._get_connection() as conn:
-            rows = conn.execute(
-                'SELECT stat_key, stat_value FROM user_stats WHERE user_id = ?',
-                (user_id,)
-            ).fetchall()
-            return {r[0]: r[1] for r in rows}
-    
-    def save_chat(self, chat_data: Dict):
-        """Save or update chat"""
-        chat_id = chat_data.get('chat_id')
-        
-        with self._get_connection() as conn:
-            existing = conn.execute('SELECT * FROM chats WHERE chat_id = ?', (chat_id,)).fetchone()
-            
-            if existing:
-                conn.execute('''
-                    UPDATE chats SET 
-                        chat_type = ?, title = ?, username = ?,
-                        messages_count = ?, last_message = ?
-                    WHERE chat_id = ?
-                ''', (
-                    chat_data.get('chat_type'),
-                    chat_data.get('title'),
-                    chat_data.get('username'),
-                    chat_data.get('messages_count', 0),
-                    chat_data.get('last_message'),
-                    chat_id
-                ))
-            else:
-                conn.execute('''
-                    INSERT INTO chats 
-                    (chat_id, chat_type, title, username, messages_count, first_message, last_message)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    chat_id,
-                    chat_data.get('chat_type'),
-                    chat_data.get('title'),
-                    chat_data.get('username'),
-                    chat_data.get('messages_count', 0),
-                    chat_data.get('first_message'),
-                    chat_data.get('last_message'),
-                ))
+            row = conn.execute('SELECT * FROM chats WHERE chat_id = ?', (chat_id,)).fetchone()
+            if row:
+                chat = dict(row)
+                users = conn.execute(
+                    'SELECT user_id FROM chat_users WHERE chat_id = ?',
+                    (chat_id,)
+                ).fetchall()
+                chat['active_users'] = [u[0] for u in users]
+                return chat
+        return None
     
     def get_stats(self) -> Dict:
-        """Get overall statistics"""
+        """Get collection statistics"""
         with self._get_connection() as conn:
-            return {
+            stats = {
+                'total_updates': conn.execute('SELECT COUNT(*) FROM updates').fetchone()[0],
                 'total_users': conn.execute('SELECT COUNT(*) FROM users').fetchone()[0],
                 'total_chats': conn.execute('SELECT COUNT(*) FROM chats').fetchone()[0],
-                'total_messages': conn.execute('SELECT SUM(messages_count) FROM users').fetchone()[0] or 0,
+                'last_update_id': self.get_last_update_id(),
             }
+        return stats
     
-    def get_top_users(self, limit: int = 10) -> List[Dict]:
+    def get_top_users(self, limit: int = 20) -> List[Dict]:
         """Get top users by message count"""
         with self._get_connection() as conn:
             rows = conn.execute(
@@ -304,14 +327,35 @@ class DatabaseManager:
                 (limit,)
             ).fetchall()
             return [dict(row) for row in rows]
+    
+    def get_top_chats(self, limit: int = 20) -> List[Dict]:
+        """Get top chats by message count"""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                'SELECT * FROM chats ORDER BY messages_count DESC LIMIT ?',
+                (limit,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+    
+    def _get_update_type(self, update: Dict) -> str:
+        """Determine update type"""
+        if 'message' in update:
+            return 'message'
+        elif 'edited_message' in update:
+            return 'edited_message'
+        elif 'callback_query' in update:
+            return 'callback_query'
+        elif 'channel_post' in update:
+            return 'channel_post'
+        return 'unknown'
 
 
 # ============================================================================
 # TELEGRAM API CLIENT
 # ============================================================================
 
-class TelegramAPI:
-    """Telegram Bot API client"""
+class TelegramAPIClient:
+    """Robust Telegram API client with retry logic"""
     
     def __init__(self, bot_token: str, config: Config, logger: logging.Logger):
         self.bot_token = bot_token
@@ -324,151 +368,147 @@ class TelegramAPI:
             total=config.max_retries,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["POST"]
+            allowed_methods=["GET", "POST"]
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
     
-    def _api_call(self, method: str, data: Optional[Dict] = None) -> Dict:
-        """Make API call"""
+    def _api_call(self, method: str, params: Optional[Dict] = None) -> Dict:
+        """Make API call with error handling"""
         url = f"{self.base_url}/{method}"
         
         try:
-            response = self.session.post(url, json=data, timeout=30)
+            response = self.session.get(url, params=params, timeout=self.config.polling_timeout)
             response.raise_for_status()
-            result = response.json()
             
-            if not result.get('ok'):
-                error_msg = result.get('description', 'Unknown error')
-                self.logger.error(f"API error: {error_msg}")
-                return {'ok': False, 'error': error_msg}
+            data = response.json()
             
-            return result
+            if not data.get('ok'):
+                error_msg = data.get('description', 'Unknown error')
+                error_code = data.get('error_code')
+                self.logger.error(f"API error [{error_code}]: {error_msg}")
+                
+                if error_code == 429:
+                    retry_after = data.get('parameters', {}).get('retry_after', 5)
+                    self.logger.warning(f"Rate limited. Waiting {retry_after}s...")
+                    time.sleep(retry_after)
+                    return self._api_call(method, params)
+                
+                return {'error': error_msg, 'error_code': error_code}
             
+            return data.get('result', {})
+            
+        except requests.exceptions.Timeout:
+            self.logger.warning(f"Timeout on {method}")
+            return {'error': 'Timeout'}
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error(f"Connection error: {e}")
+            return {'error': f'Connection error: {e}'}
         except Exception as e:
-            self.logger.error(f"API call error: {e}")
-            return {'ok': False, 'error': str(e)}
+            self.logger.error(f"Unexpected error in {method}: {e}")
+            return {'error': str(e)}
     
-    def send_message(self, chat_id: int, text: str, reply_markup: Optional[Dict] = None, 
-                    parse_mode: str = 'HTML') -> Dict:
-        """Send message"""
-        data = {
-            'chat_id': chat_id,
-            'text': text,
-            'parse_mode': parse_mode
-        }
-        if reply_markup:
-            data['reply_markup'] = reply_markup
-        
-        return self._api_call('sendMessage', data)
-    
-    def edit_message(self, chat_id: int, message_id: int, text: str, 
-                    reply_markup: Optional[Dict] = None, parse_mode: str = 'HTML') -> Dict:
-        """Edit message"""
-        data = {
-            'chat_id': chat_id,
-            'message_id': message_id,
-            'text': text,
-            'parse_mode': parse_mode
-        }
-        if reply_markup:
-            data['reply_markup'] = reply_markup
-        
-        return self._api_call('editMessageText', data)
-    
-    def answer_callback(self, callback_query_id: str, text: str = None, 
-                       show_alert: bool = False) -> Dict:
-        """Answer callback query"""
-        data = {'callback_query_id': callback_query_id}
-        if text:
-            data['text'] = text
-            data['show_alert'] = show_alert
-        
-        return self._api_call('answerCallbackQuery', data)
+    def get_me(self) -> Dict:
+        """Get bot information"""
+        return self._api_call('getMe')
     
     def get_updates(self, offset: Optional[int] = None, timeout: int = 30) -> List[Dict]:
-        """Get updates"""
-        data = {
+        """Get updates from Telegram"""
+        params = {
             'timeout': timeout,
-            'allowed_updates': ['message', 'callback_query']
+            'allowed_updates': ['message', 'edited_message', 'callback_query', 'channel_post']
         }
         if offset:
-            data['offset'] = offset
+            params['offset'] = offset
         
-        result = self._api_call('getUpdates', data)
-        return result.get('result', []) if result.get('ok') else []
+        result = self._api_call('getUpdates', params)
+        return result if isinstance(result, list) else []
 
 
 # ============================================================================
-# KEYBOARD BUILDER
+# DATA PROCESSOR
 # ============================================================================
 
-class KeyboardBuilder:
-    """Build keyboards for messages"""
+class DataProcessor:
+    """Process and analyze Telegram data"""
     
-    @staticmethod
-    def inline_keyboard(buttons: List[List[Dict]]) -> Dict:
-        """Build inline keyboard"""
-        return {
-            'inline_keyboard': [
-                [{'text': btn['text'], 'callback_data': btn['callback_data']} for btn in row]
-                for row in buttons
-            ]
-        }
+    def __init__(self, db: DatabaseManager, logger: logging.Logger):
+        self.db = db
+        self.logger = logger
+        self._users_cache: Dict[int, Dict] = {}
+        self._chats_cache: Dict[int, Dict] = {}
     
-    @staticmethod
-    def reply_keyboard(buttons: List[List[str]], resize: bool = True, 
-                      one_time: bool = False) -> Dict:
-        """Build reply keyboard"""
-        return {
-            'keyboard': [[{'text': text} for text in row] for row in buttons],
-            'resize_keyboard': resize,
-            'one_time_keyboard': one_time
-        }
-    
-    @staticmethod
-    def remove_keyboard() -> Dict:
-        """Remove keyboard"""
-        return {'remove_keyboard': True}
-
-
-# ============================================================================
-# BOT HANDLER
-# ============================================================================
-
-class TelegramBot:
-    """Interactive Telegram Bot"""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.logger = setup_logging(config)
-        self.api = TelegramAPI(config.bot_token, config, self.logger)
-        self.db = DatabaseManager(config.data_dir / config.db_file, self.logger)
-        self.kb = KeyboardBuilder()
+    def process_update(self, update: Dict):
+        """Process a single update"""
+        self.db.save_update(update)
         
-        self.running = False
-        self._setup_signal_handlers()
+        message = update.get('message') or update.get('edited_message')
+        if message:
+            self._process_message(message)
+        
+        callback = update.get('callback_query')
+        if callback:
+            self._process_callback(callback)
+        
+        channel_post = update.get('channel_post')
+        if channel_post:
+            self._process_message(channel_post)
     
-    def _setup_signal_handlers(self):
-        """Setup signal handlers"""
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+    def _process_message(self, message: Dict):
+        """Process message data"""
+        from_user = message.get('from', {})
+        chat = message.get('chat', {})
+        timestamp = datetime.fromtimestamp(message['date']).isoformat()
+        
+        if from_user:
+            user_id = from_user.get('id')
+            user_data = self._get_or_create_user(user_id, from_user, timestamp)
+            
+            user_data['messages_count'] += 1
+            user_data['last_seen'] = timestamp
+            
+            chat_type = chat.get('type', 'unknown')
+            user_data.setdefault('chat_types', defaultdict(int))
+            user_data['chat_types'][chat_type] += 1
+            
+            msg_type = self._get_message_type(message)
+            user_data.setdefault('message_types', defaultdict(int))
+            user_data['message_types'][msg_type] += 1
+            
+            self._users_cache[user_id] = user_data
+        
+        if chat:
+            chat_id = chat.get('id')
+            chat_data = self._get_or_create_chat(chat_id, chat, timestamp)
+            
+            chat_data['messages_count'] += 1
+            chat_data['last_message'] = timestamp
+            
+            if from_user:
+                chat_data.setdefault('active_users', set()).add(from_user.get('id'))
+            
+            self._chats_cache[chat_id] = chat_data
     
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        self.logger.info(f"\n⚠️  Received signal {signum}, shutting down...")
-        self.running = False
+    def _process_callback(self, callback: Dict):
+        """Process callback query"""
+        from_user = callback.get('from', {})
+        if from_user:
+            user_id = from_user.get('id')
+            if user_id in self._users_cache:
+                self._users_cache[user_id]['messages_count'] += 1
+                self._users_cache[user_id]['last_seen'] = datetime.now().isoformat()
     
-    def _get_or_create_user(self, user_data: Dict) -> Dict:
-        """Get or create user"""
-        user_id = user_data.get('id')
+    def _get_or_create_user(self, user_id: int, user_data: Dict, timestamp: str) -> Dict:
+        """Get existing user or create new one"""
+        if user_id in self._users_cache:
+            return self._users_cache[user_id]
+        
         existing = self.db.get_user(user_id)
-        
         if existing:
             return existing
         
-        now = datetime.now().isoformat()
-        new_user = {
+        return {
             'user_id': user_id,
             'first_name': user_data.get('first_name'),
             'last_name': user_data.get('last_name'),
@@ -476,489 +516,376 @@ class TelegramBot:
             'language_code': user_data.get('language_code'),
             'is_premium': user_data.get('is_premium', False),
             'messages_count': 0,
-            'first_seen': now,
-            'last_seen': now,
+            'first_seen': timestamp,
+            'last_seen': None,
+            'chat_types': defaultdict(int),
+            'message_types': defaultdict(int),
         }
-        
-        self.db.save_user(new_user)
-        return new_user
     
-    def _update_user_activity(self, user_id: int, is_command: bool = False):
-        """Update user activity"""
-        user = self.db.get_user(user_id)
-        if user:
-            user['messages_count'] = user.get('messages_count', 0) + 1
-            user['last_seen'] = datetime.now().isoformat()
-            if is_command:
-                user['commands_count'] = user.get('commands_count', 0) + 1
-            self.db.save_user(user)
-    
-    def _update_chat(self, chat_data: Dict):
-        """Update chat data"""
-        chat_id = chat_data.get('id')
-        now = datetime.now().isoformat()
+    def _get_or_create_chat(self, chat_id: int, chat_data: Dict, timestamp: str) -> Dict:
+        """Get existing chat or create new one"""
+        if chat_id in self._chats_cache:
+            return self._chats_cache[chat_id]
         
-        chat = {
+        existing = self.db.get_chat(chat_id)
+        if existing:
+            return existing
+        
+        return {
             'chat_id': chat_id,
-            'chat_type': chat_data.get('type'),
+            'type': chat_data.get('type'),
             'title': chat_data.get('title'),
             'username': chat_data.get('username'),
-            'messages_count': 1,
-            'first_message': now,
-            'last_message': now,
+            'first_name': chat_data.get('first_name'),
+            'last_name': chat_data.get('last_name'),
+            'messages_count': 0,
+            'first_message': timestamp,
+            'last_message': None,
+            'active_users': set(),
         }
-        
-        self.db.save_chat(chat)
     
-    # ========================================================================
-    # COMMAND HANDLERS
-    # ========================================================================
+    def _get_message_type(self, message: Dict) -> str:
+        """Determine message type"""
+        if 'text' in message:
+            return 'text'
+        elif 'photo' in message:
+            return 'photo'
+        elif 'video' in message:
+            return 'video'
+        elif 'document' in message:
+            return 'document'
+        elif 'audio' in message:
+            return 'audio'
+        elif 'voice' in message:
+            return 'voice'
+        elif 'sticker' in message:
+            return 'sticker'
+        elif 'animation' in message:
+            return 'animation'
+        elif 'location' in message:
+            return 'location'
+        elif 'contact' in message:
+            return 'contact'
+        return 'other'
     
-    def handle_start(self, message: Dict):
-        """Handle /start command"""
-        chat_id = message['chat']['id']
-        user = message['from']
+    def save_batch(self):
+        """Save cached data to database"""
+        for user_data in self._users_cache.values():
+            self.db.save_user(user_data)
         
-        self._get_or_create_user(user)
-        self._update_user_activity(user['id'], is_command=True)
-        self.db.increment_user_stat(user['id'], 'start_commands')
+        for chat_data in self._chats_cache.values():
+            if 'active_users' in chat_data:
+                chat_data['active_users'] = list(chat_data['active_users'])
+            self.db.save_chat(chat_data)
         
-        text = (
-            f"👋 سلام {user.get('first_name', '')}!\n\n"
-            f"به ربات تعاملی خوش اومدی!\n\n"
-            f"📋 دستورات موجود:\n"
-            f"• /menu - منوی اصلی\n"
-            f"• /stats - آمار شما\n"
-            f"• /help - راهنما\n"
-            f"• /about - درباره ربات\n"
-            f"• /settings - تنظیمات\n\n"
-            f"روی دکمه‌ها کلیک کن یا دستورات رو تایپ کن!"
-        )
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '📊 آمار', 'callback_data': 'stats'}, {'text': '⚙️ تنظیمات', 'callback_data': 'settings'}],
-            [{'text': 'ℹ️ درباره', 'callback_data': 'about'}, {'text': '❓ راهنما', 'callback_data': 'help'}],
-        ])
-        
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
+        self._users_cache.clear()
+        self._chats_cache.clear()
+
+
+# ============================================================================
+# POLLING COLLECTOR (SERVER MODE)
+# ============================================================================
+
+class TelegramPollingCollector:
+    """Production-ready collector for server deployment"""
     
-    def handle_menu(self, message: Dict):
-        """Handle /menu command"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = setup_logging(config)
+        self.api = TelegramAPIClient(config.bot_token, config, self.logger)
+        self.db = DatabaseManager(config.data_dir / config.db_file, self.logger)
+        self.processor = DataProcessor(self.db, self.logger)
         
-        self._update_user_activity(user_id, is_command=True)
-        self.db.increment_user_stat(user_id, 'menu_commands')
-        
-        text = "📋 منوی اصلی\n\nیکی از گزینه‌ها رو انتخاب کن:"
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '📊 آمار من', 'callback_data': 'stats'}, {'text': '🏆 برترین‌ها', 'callback_data': 'top_users'}],
-            [{'text': '⚙️ تنظیمات', 'callback_data': 'settings'}, {'text': '📝 راهنما', 'callback_data': 'help'}],
-            [{'text': '🔄 به‌روزرسانی', 'callback_data': 'refresh'}],
-        ])
-        
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
+        self.running = False
+        self.last_health_check = 0
+        self._setup_signal_handlers()
     
-    def handle_stats(self, message: Dict):
-        """Handle /stats command"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
-        
-        self._update_user_activity(user_id, is_command=True)
-        
-        user = self.db.get_user(user_id)
-        user_stats = self.db.get_user_stats(user_id)
-        
-        if not user:
-            self.api.send_message(chat_id, "❌ اطلاعات کاربر یافت نشد")
-            return
-        
-        text = (
-            f"📊 آمار شما\n\n"
-            f"👤 نام: {user.get('first_name', 'N/A')} {user.get('last_name', '')}\n"
-            f"🆔 آیدی: <code>{user_id}</code>\n"
-            f"💬 پیام‌ها: {user.get('messages_count', 0)}\n"
-            f"📅 اولین بازدید: {user.get('first_seen', 'N/A')[:10]}\n"
-            f"🕐 آخرین بازدید: {user.get('last_seen', 'N/A')[:10]}\n\n"
-            f"📈 آمار دستورات:\n"
-            f"• /start: {user_stats.get('start_commands', 0)}\n"
-            f"• /menu: {user_stats.get('menu_commands', 0)}\n"
-            f"• /stats: {user_stats.get('stats_commands', 0)}\n"
-            f"• /help: {user_stats.get('help_commands', 0)}"
-        )
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 بازگشت', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
+    def _setup_signal_handlers(self):
+        """Setup graceful shutdown handlers"""
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
     
-    def handle_help(self, message: Dict):
-        """Handle /help command"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
-        
-        self._update_user_activity(user_id, is_command=True)
-        self.db.increment_user_stat(user_id, 'help_commands')
-        
-        text = (
-            "❓ راهنمای استفاده\n\n"
-            "📋 دستورات:\n"
-            "• /start - شروع و خوش‌آمدگویی\n"
-            "• /menu - منوی اصلی\n"
-            "• /stats - نمایش آمار شما\n"
-            "• /help - این راهنما\n"
-            "• /about - درباره ربات\n"
-            "• /settings - تنظیمات\n\n"
-            "🎮 دکمه‌ها:\n"
-            "• روی دکمه‌های زیر پیام کلیک کن\n"
-            "• هر دکمه یه عملکرد خاص داره\n\n"
-            "💡 نکته: می‌تونی هر متنی رو بفرستی تا ذخیره بشه!"
-        )
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 منو', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        self.logger.info(f"\n⚠️  Received signal {signum}, shutting down gracefully...")
+        self.running = False
     
-    def handle_about(self, message: Dict):
-        """Handle /about command"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
-        
-        self._update_user_activity(user_id, is_command=True)
-        
-        stats = self.db.get_stats()
-        
-        text = (
-            "ℹ️ درباره ربات\n\n"
-            "🤖 ربات تعاملی تلگرام\n"
-            "📌 نسخه: 4.0\n"
-            "🛠️ ساخته شده با: Python + SQLite\n\n"
-            f"📊 آمار کلی:\n"
-            f"• 👥 کاربران: {stats['total_users']}\n"
-            f"• 💬 چت‌ها: {stats['total_chats']}\n"
-            f"• 📨 پیام‌ها: {stats['total_messages']}\n\n"
-            "✨ این ربات برای تست و یادگیری ساخته شده"
-        )
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 بازگشت', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
-    
-    def handle_settings(self, message: Dict):
-        """Handle /settings command"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
-        
-        self._update_user_activity(user_id, is_command=True)
-        
-        text = "⚙️ تنظیمات\n\nتنظیمات مورد نظر رو انتخاب کن:"
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🌐 زبان', 'callback_data': 'settings_language'}, {'text': '🔔 اعلان‌ها', 'callback_data': 'settings_notifications'}],
-            [{'text': '🎨 تم', 'callback_data': 'settings_theme'}, {'text': '🔙 بازگشت', 'callback_data': 'menu'}],
-        ])
-        
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
-    
-    def handle_unknown(self, message: Dict):
-        """Handle unknown message"""
-        chat_id = message['chat']['id']
-        user_id = message['from']['id']
-        
-        self._update_user_activity(user_id)
-        
-        text = message.get('text', '')
-        
-        if text.startswith('/'):
-            response = f"❓ دستور ناشناخته: {text}\n\nاز /help برای دیدن دستورات استفاده کن"
-        else:
-            response = f"✅ پیام شما دریافت شد:\n\n«{text}»\n\nاین پیام ذخیره شد!"
-            self.db.increment_user_stat(user_id, 'text_messages')
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '📋 منو', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.send_message(chat_id, response, reply_markup=keyboard)
-    
-    # ========================================================================
-    # CALLBACK HANDLERS
-    # ========================================================================
-    
-    def handle_callback(self, callback_query: Dict):
-        """Handle callback query"""
-        callback_id = callback_query['id']
-        data = callback_query.get('data', '')
-        chat_id = callback_query['message']['chat']['id']
-        message_id = callback_query['message']['message_id']
-        user_id = callback_query['from']['id']
-        
-        self._update_user_activity(user_id)
-        
-        # Answer callback to remove loading indicator
-        self.api.answer_callback(callback_id)
-        
-        # Route to appropriate handler
-        if data == 'stats':
-            self._callback_stats(chat_id, message_id, user_id)
-        elif data == 'menu':
-            self._callback_menu(chat_id, message_id, user_id)
-        elif data == 'help':
-            self._callback_help(chat_id, message_id, user_id)
-        elif data == 'about':
-            self._callback_about(chat_id, message_id, user_id)
-        elif data == 'settings':
-            self._callback_settings(chat_id, message_id, user_id)
-        elif data == 'top_users':
-            self._callback_top_users(chat_id, message_id, user_id)
-        elif data == 'refresh':
-            self._callback_refresh(chat_id, message_id, user_id)
-        elif data.startswith('settings_'):
-            self._callback_settings_option(chat_id, message_id, user_id, data)
-        else:
-            self.api.send_message(chat_id, f"⚠️ گزینه ناشناخته: {data}")
-    
-    def _callback_stats(self, chat_id: int, message_id: int, user_id: int):
-        """Callback for stats"""
-        user = self.db.get_user(user_id)
-        user_stats = self.db.get_user_stats(user_id)
-        
-        text = (
-            f"📊 آمار شما\n\n"
-            f"👤 نام: {user.get('first_name', 'N/A')}\n"
-            f"💬 پیام‌ها: {user.get('messages_count', 0)}\n"
-            f"📅 اولین بازدید: {user.get('first_seen', 'N/A')[:10]}\n\n"
-            f"📈 آمار دستورات:\n"
-            f"• /start: {user_stats.get('start_commands', 0)}\n"
-            f"• /menu: {user_stats.get('menu_commands', 0)}\n"
-            f"• /stats: {user_stats.get('stats_commands', 0)}"
-        )
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 بازگشت', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    def _callback_menu(self, chat_id: int, message_id: int, user_id: int):
-        """Callback for menu"""
-        text = "📋 منوی اصلی\n\nیکی از گزینه‌ها رو انتخاب کن:"
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '📊 آمار من', 'callback_data': 'stats'}, {'text': '🏆 برترین‌ها', 'callback_data': 'top_users'}],
-            [{'text': '⚙️ تنظیمات', 'callback_data': 'settings'}, {'text': '📝 راهنما', 'callback_data': 'help'}],
-            [{'text': '🔄 به‌روزرسانی', 'callback_data': 'refresh'}],
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    def _callback_help(self, chat_id: int, message_id: int, user_id: int):
-        """Callback for help"""
-        text = (
-            "❓ راهنما\n\n"
-            "📋 دستورات:\n"
-            "• /start - شروع\n"
-            "• /menu - منو\n"
-            "• /stats - آمار\n"
-            "• /help - راهنما\n"
-            "• /about - درباره\n"
-            "• /settings - تنظیمات"
-        )
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 بازگشت', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    def _callback_about(self, chat_id: int, message_id: int, user_id: int):
-        """Callback for about"""
-        stats = self.db.get_stats()
-        
-        text = (
-            "ℹ️ درباره ربات\n\n"
-            "🤖 ربات تعاملی تلگرام\n"
-            "📌 نسخه: 4.0\n\n"
-            f"📊 آمار:\n"
-            f"• 👥 کاربران: {stats['total_users']}\n"
-            f"• 💬 چت‌ها: {stats['total_chats']}\n"
-            f"• 📨 پیام‌ها: {stats['total_messages']}"
-        )
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 بازگشت', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    def _callback_settings(self, chat_id: int, message_id: int, user_id: int):
-        """Callback for settings"""
-        text = "⚙️ تنظیمات\n\nتنظیمات مورد نظر رو انتخاب کن:"
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🌐 زبان', 'callback_data': 'settings_language'}, {'text': '🔔 اعلان‌ها', 'callback_data': 'settings_notifications'}],
-            [{'text': '🎨 تم', 'callback_data': 'settings_theme'}, {'text': '🔙 بازگشت', 'callback_data': 'menu'}],
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    def _callback_top_users(self, chat_id: int, message_id: int, user_id: int):
-        """Callback for top users"""
-        top_users = self.db.get_top_users(10)
-        
-        text = "🏆 برترین کاربران\n\n"
-        
-        if not top_users:
-            text += "هنوز کاربری ثبت نشده!"
-        else:
-            for i, user in enumerate(top_users, 1):
-                name = user.get('first_name', 'ناشناس')
-                count = user.get('messages_count', 0)
-                text += f"{i}. {name} - {count} پیام\n"
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 بازگشت', 'callback_data': 'menu'}]
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    def _callback_refresh(self, chat_id: int, message_id: int, user_id: int):
-        """Callback for refresh"""
-        self.api.answer_callback(
-            f"refresh_{user_id}",
-            text="✅ به‌روزرسانی شد!",
-            show_alert=False
-        )
-        
-        text = "🔄 به‌روزرسانی شد!\n\nمنو دوباره بارگذاری شد."
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '📊 آمار من', 'callback_data': 'stats'}, {'text': '🏆 برترین‌ها', 'callback_data': 'top_users'}],
-            [{'text': '⚙️ تنظیمات', 'callback_data': 'settings'}, {'text': '📝 راهنما', 'callback_data': 'help'}],
-            [{'text': '🔄 به‌روزرسانی', 'callback_data': 'refresh'}],
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    def _callback_settings_option(self, chat_id: int, message_id: int, 
-                                 user_id: int, option: str):
-        """Callback for settings options"""
-        option_name = option.replace('settings_', '')
-        
-        text = f"⚙️ تنظیمات {option_name}\n\nاین گزینه در نسخه بعدی فعال می‌شود!"
-        
-        keyboard = self.kb.inline_keyboard([
-            [{'text': '🔙 بازگشت', 'callback_data': 'settings'}]
-        ])
-        
-        self.api.edit_message(chat_id, message_id, text, reply_markup=keyboard)
-    
-    # ========================================================================
-    # MESSAGE PROCESSOR
-    # ========================================================================
-    
-    def process_message(self, message: Dict):
-        """Process incoming message"""
-        chat = message.get('chat', {})
-        user = message.get('from', {})
-        text = message.get('text', '')
-        
-        # Update chat
-        self._update_chat(chat)
-        
-        # Route to command handler
-        if text.startswith('/'):
-            command = text.split()[0].lower().split('@')[0]
-            
-            if command == '/start':
-                self.handle_start(message)
-            elif command == '/menu':
-                self.handle_menu(message)
-            elif command == '/stats':
-                self.handle_stats(message)
-            elif command == '/help':
-                self.handle_help(message)
-            elif command == '/about':
-                self.handle_about(message)
-            elif command == '/settings':
-                self.handle_settings(message)
-            else:
-                self.handle_unknown(message)
-        else:
-            self.handle_unknown(message)
-    
-    def process_callback(self, callback_query: Dict):
-        """Process callback query"""
-        self.handle_callback(callback_query)
-    
-    # ========================================================================
-    # MAIN LOOP
-    # ========================================================================
+    def _health_check(self):
+        """Perform periodic health check"""
+        current_time = time.time()
+        if current_time - self.last_health_check >= self.config.health_check_interval:
+            stats = self.db.get_stats()
+            self.logger.info(
+                f"📊 Health Check - Updates: {stats['total_updates']}, "
+                f"Users: {stats['total_users']}, Chats: {stats['total_chats']}"
+            )
+            self.last_health_check = current_time
     
     def start_polling(self):
-        """Start polling loop"""
+        """Start polling loop (server mode)"""
         self.logger.info("=" * 70)
-        self.logger.info("🚀 Starting Interactive Telegram Bot v4.0")
+        self.logger.info("🚀 Starting Telegram Polling Collector v4.0 - Server Mode")
         self.logger.info("=" * 70)
         
-        # Test connection
-        result = self.api._api_call('getMe')
-        if not result.get('ok'):
-            self.logger.error(f"❌ Cannot connect: {result.get('error')}")
+        bot_info = self.api.get_me()
+        
+        if 'error' in bot_info:
+            self.logger.error(f"❌ Cannot start polling: {bot_info.get('error')}")
             return False
         
-        bot_info = result.get('result', {})
         self.logger.info(f"✅ Bot connected: @{bot_info.get('username')} (ID: {bot_info.get('id')})")
         
         self.running = True
-        offset = None
+        offset = self.db.get_last_update_id() + 1
+        updates_processed = 0
         
-        self.logger.info("📡 Starting polling...")
+        self.logger.info(f"📡 Starting polling from offset {offset}...")
         self.logger.info(f"📁 Data directory: {self.config.data_dir.absolute()}")
+        self.logger.info(f"📝 Log file: {self.config.log_file}")
         
         try:
             while self.running:
                 updates = self.api.get_updates(offset=offset, timeout=self.config.polling_timeout)
                 
                 if updates:
+                    self.logger.info(f"📥 Received {len(updates)} updates")
+                    
                     for update in updates:
+                        self.processor.process_update(update)
                         offset = update['update_id'] + 1
-                        
-                        if 'message' in update:
-                            self.process_message(update['message'])
-                        elif 'callback_query' in update:
-                            self.process_callback(update['callback_query'])
+                        updates_processed += 1
+                    
+                    if updates_processed >= self.config.batch_save_size:
+                        self.processor.save_batch()
+                        self.logger.info(f"💾 Saved batch ({updates_processed} updates)")
+                        updates_processed = 0
                 
+                self._health_check()
                 time.sleep(self.config.rate_limit_delay)
                 
         except KeyboardInterrupt:
             self.logger.info("\n⚠️  Interrupted by user")
         except Exception as e:
-            self.logger.error(f"❌ Error: {e}", exc_info=True)
+            self.logger.error(f"❌ Polling error: {e}", exc_info=True)
             raise
         finally:
-            self.logger.info("✅ Bot stopped")
+            self.running = False
+            self.processor.save_batch()
+            self.logger.info("✅ Data saved successfully")
+            self._print_stats()
         
         return True
+    
+    def _print_stats(self):
+        """Print collection statistics"""
+        stats = self.db.get_stats()
+        
+        self.logger.info("\n" + "=" * 70)
+        self.logger.info("📊 Final Statistics:")
+        self.logger.info("=" * 70)
+        self.logger.info(f"  📥 Total updates: {stats['total_updates']}")
+        self.logger.info(f"  👥 Total users: {stats['total_users']}")
+        self.logger.info(f"  💬 Total chats: {stats['total_chats']}")
+        self.logger.info(f"  🔢 Last update ID: {stats['last_update_id']}")
 
 
 # ============================================================================
-# MAIN
+# EXPORT MANAGER
 # ============================================================================
+
+class ExportManager:
+    """Export data to various formats"""
+    
+    def __init__(self, db: DatabaseManager, logger: logging.Logger):
+        self.db = db
+        self.logger = logger
+    
+    def export_json(self, output_file: str):
+        """Export to JSON format"""
+        report = {
+            '_metadata': {
+                'version': '4.0',
+                'timestamp': datetime.now().isoformat(),
+                'collector': 'TelegramPollingCollector',
+            },
+            'stats': self.db.get_stats(),
+            'top_users': self.db.get_top_users(50),
+            'top_chats': self.db.get_top_chats(50),
+        }
+        
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        
+        self.logger.info(f"💾 JSON report saved: {output_file}")
+    
+    def export_csv(self, output_dir: str):
+        """Export to CSV format"""
+        import csv
+        
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        users_file = Path(output_dir) / 'users.csv'
+        with open(users_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'user_id', 'first_name', 'last_name', 'username', 
+                'language_code', 'is_premium', 'messages_count', 
+                'first_seen', 'last_seen'
+            ])
+            writer.writeheader()
+            for user in self.db.get_top_users(10000):
+                writer.writerow(user)
+        
+        chats_file = Path(output_dir) / 'chats.csv'
+        with open(chats_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'chat_id', 'chat_type', 'title', 'username',
+                'first_name', 'last_name', 'messages_count',
+                'first_message', 'last_message'
+            ])
+            writer.writeheader()
+            for chat in self.db.get_top_chats(10000):
+                writer.writerow(chat)
+        
+        self.logger.info(f"💾 CSV files saved to: {output_dir}")
+
+
+# ============================================================================
+# CLI INTERFACE
+# ============================================================================
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create command-line argument parser"""
+    parser = argparse.ArgumentParser(
+        description='Telegram Bot Intelligence Collector v4.0 - Server Edition',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  %(prog)s poll                    Start polling mode (server)
+  %(prog)s stats                   Show collection statistics
+  %(prog)s user <user_id>          Search user by ID
+  %(prog)s chat <chat_id>          Search chat by ID
+  %(prog)s export --format json    Export data to JSON
+        '''
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Poll command
+    poll_parser = subparsers.add_parser('poll', help='Start polling mode (server)')
+    
+    # Stats command
+    stats_parser = subparsers.add_parser('stats', help='Show statistics')
+    
+    # User command
+    user_parser = subparsers.add_parser('user', help='Search user')
+    user_parser.add_argument('user_id', type=int, help='User ID')
+    
+    # Chat command
+    chat_parser = subparsers.add_parser('chat', help='Search chat')
+    chat_parser.add_argument('chat_id', type=int, help='Chat ID')
+    
+    # Export command
+    export_parser = subparsers.add_parser('export', help='Export data')
+    export_parser.add_argument('--format', choices=['json', 'csv', 'all'], default='json')
+    export_parser.add_argument('--output', help='Output file/directory')
+    
+    return parser
+
 
 def main():
     """Main entry point"""
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    
     try:
+        # Load configuration from .env
         config = Config.from_env()
-        bot = TelegramBot(config)
-        success = bot.start_polling()
-        sys.exit(0 if success else 1)
+        
+        if args.command == 'poll':
+            collector = TelegramPollingCollector(config)
+            success = collector.start_polling()
+            sys.exit(0 if success else 1)
+        
+        elif args.command == 'stats':
+            logger = setup_logging(config)
+            db = DatabaseManager(config.data_dir / config.db_file, logger)
+            stats = db.get_stats()
+            
+            print("\n" + "=" * 70)
+            print("📊 Collection Statistics:")
+            print("=" * 70)
+            print(f"  📥 Total updates: {stats['total_updates']}")
+            print(f"  👥 Total users: {stats['total_users']}")
+            print(f"  💬 Total chats: {stats['total_chats']}")
+            print(f"  🔢 Last update ID: {stats['last_update_id']}")
+            
+            print("\n🏆 Top Users:")
+            for i, user in enumerate(db.get_top_users(10), 1):
+                print(f"  {i}. {user.get('first_name')} (ID: {user.get('user_id')}) - {user.get('messages_count')} messages")
+        
+        elif args.command == 'user':
+            logger = setup_logging(config)
+            db = DatabaseManager(config.data_dir / config.db_file, logger)
+            user = db.get_user(args.user_id)
+            
+            if user:
+                print("\n" + "=" * 70)
+                print(f"👤 User {args.user_id}:")
+                print("=" * 70)
+                print(f"  • Name: {user.get('first_name')} {user.get('last_name', '')}")
+                print(f"  • Username: @{user.get('username', 'N/A')}")
+                print(f"  • Messages: {user.get('messages_count', 0)}")
+                print(f"  • First seen: {user.get('first_seen', 'N/A')}")
+                print(f"  • Last seen: {user.get('last_seen', 'N/A')}")
+                print(f"  • Premium: {user.get('is_premium', False)}")
+                print(f"  • Language: {user.get('language_code', 'N/A')}")
+                if user.get('message_types'):
+                    print(f"  • Message types: {user.get('message_types')}")
+            else:
+                print(f"❌ User {args.user_id} not found")
+        
+        elif args.command == 'chat':
+            logger = setup_logging(config)
+            db = DatabaseManager(config.data_dir / config.db_file, logger)
+            chat = db.get_chat(args.chat_id)
+            
+            if chat:
+                print("\n" + "=" * 70)
+                print(f"💬 Chat {args.chat_id}:")
+                print("=" * 70)
+                print(f"  • Title: {chat.get('title') or chat.get('first_name', 'N/A')}")
+                print(f"  • Type: {chat.get('chat_type', 'N/A')}")
+                print(f"  • Username: @{chat.get('username', 'N/A')}")
+                print(f"  • Messages: {chat.get('messages_count', 0)}")
+                print(f"  • First message: {chat.get('first_message', 'N/A')}")
+                print(f"  • Last message: {chat.get('last_message', 'N/A')}")
+                print(f"  • Active users: {len(chat.get('active_users', []))}")
+            else:
+                print(f"❌ Chat {args.chat_id} not found")
+        
+        elif args.command == 'export':
+            logger = setup_logging(config)
+            db = DatabaseManager(config.data_dir / config.db_file, logger)
+            exporter = ExportManager(db, logger)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            if args.format in ['json', 'all']:
+                output = args.output or f"exports/telegram_report_{timestamp}.json"
+                exporter.export_json(output)
+            
+            if args.format in ['csv', 'all']:
+                output_dir = args.output or f"exports/telegram_export_{timestamp}"
+                exporter.export_csv(output_dir)
+            
+            print("✅ Export completed!")
+    
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
