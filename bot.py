@@ -33,14 +33,16 @@ class Config:
     """Application configuration"""
     bot_token: str
     data_dir: Path = Path("telegram_data")
-    db_file: str = "bot.db"
+    db_file: str = "collector.db"
     log_level: str = "INFO"
-    log_file: str = "logs/bot.log"
+    log_file: str = "logs/collector.log"
+    log_max_bytes: int = 10 * 1024 * 1024  # 10MB
+    log_backup_count: int = 5
     polling_timeout: int = 30
     max_retries: int = 3
     rate_limit_delay: float = 0.1
-
-
+    batch_save_size: int = 50
+    health_check_interval: int = 300  # 5 minutes
     @classmethod
     def from_env(cls) -> 'Config':
         """Load configuration from environment variables or .env file"""
