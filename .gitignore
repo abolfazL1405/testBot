@@ -1,3 +1,13 @@
 .env
+.venv/
+venv/
 __pycache__/
 *.pyc
+sessions/
+outputs/
+*.session
+*.session-journal
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
