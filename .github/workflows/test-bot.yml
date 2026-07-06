@@ -27,16 +27,25 @@ jobs:
         run: |
           echo "🚀 Starting simple bot test (3 hours)..."
           echo "⏰ Start time: $(date)"
-          echo "🤖 Bot will run until: $(date -d '+3 hours')"
+          echo " Bot will run until: $(date -d '+3 hours')"
           
+          # Initialize EXIT_CODE
+          EXIT_CODE=0
+          
+          # Run bot with timeout (10800 seconds = 3 hours)
           timeout 10800 python bot.py || EXIT_CODE=$?
           
           echo "⏰ End time: $(date)"
+          echo "Exit code: $EXIT_CODE"
           
+          # Exit code 124 means timeout (expected after 3 hours)
           if [ $EXIT_CODE -eq 124 ]; then
             echo "✅ Bot ran for 3 hours successfully"
             exit 0
-          elif [ $EXIT_CODE -ne 0 ]; then
+          elif [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Bot completed successfully"
+            exit 0
+          else
             echo "❌ Bot exited with code $EXIT_CODE"
             exit $EXIT_CODE
           fi
