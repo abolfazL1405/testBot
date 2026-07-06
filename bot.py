@@ -39,24 +39,38 @@ class Config:
     polling_timeout: int = 30
     max_retries: int = 3
     rate_limit_delay: float = 0.1
-    
+
+
     @classmethod
     def from_env(cls) -> 'Config':
-        """Load configuration from .env file"""
+        """Load configuration from environment variables or .env file"""
         load_dotenv()
         
+        # Try environment variable first (for GitHub Actions)
         token = os.getenv('TELEGRAM_BOT_TOKEN')
+        
+        # If not found, try to read from .env file
         if not token:
-            raise ValueError("TELEGRAM_BOT_TOKEN not found in .env file")
+            token = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+        
+        if not token:
+            raise ValueError(
+                "TELEGRAM_BOT_TOKEN not found. "
+                "Set it as environment variable or in .env file"
+            )
         
         return cls(
             bot_token=token,
             data_dir=Path(os.getenv('DATA_DIR', 'telegram_data')),
-            db_file=os.getenv('DB_FILE', 'bot.db'),
+            db_file=os.getenv('DB_FILE', 'collector.db'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
-            log_file=os.getenv('LOG_FILE', 'logs/bot.log'),
+            log_file=os.getenv('LOG_FILE', 'logs/collector.log'),
+            log_max_bytes=int(os.getenv('LOG_MAX_BYTES', str(10 * 1024 * 1024))),
+            log_backup_count=int(os.getenv('LOG_BACKUP_COUNT', '5')),
             polling_timeout=int(os.getenv('POLLING_TIMEOUT', '30')),
             max_retries=int(os.getenv('MAX_RETRIES', '3')),
+            batch_save_size=int(os.getenv('BATCH_SAVE_SIZE', '50')),
+            health_check_interval=int(os.getenv('HEALTH_CHECK_INTERVAL', '300')),
         )
 
 
