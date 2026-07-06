@@ -21,5 +21,3 @@ jobs:
       
       - name: Run bot
         run: python bot.py
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
