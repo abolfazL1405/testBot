@@ -1,12 +1,12 @@
 name: Test Bot (3 Hours)
 
 on:
-  workflow_dispatch:  # اجرا دستی از طریق دکمه "Run workflow"
+  workflow_dispatch:
 
 jobs:
   test-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # 3 ساعت
+    timeout-minutes: 180
     
     steps:
       - name: Checkout code
@@ -23,27 +23,43 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Create .env file
+      - name: Verify token is set
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" > .env
-          echo "DATA_DIR=telegram_data" >> .env
-          echo "DB_FILE=collector.db" >> .env
-          echo "LOG_LEVEL=INFO" >> .env
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "❌ TELEGRAM_BOT_TOKEN is not set in GitHub Secrets!"
+            echo "Please go to Settings → Secrets and variables → Actions"
+            echo "And add TELEGRAM_BOT_TOKEN secret"
+            exit 1
+          fi
+          echo "✅ TELEGRAM_BOT_TOKEN is set (length: ${#TELEGRAM_BOT_TOKEN})"
       
       - name: Run bot for 3 hours
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DATA_DIR: telegram_data
+          DB_FILE: collector.db
+          LOG_LEVEL: INFO
+          LOG_FILE: logs/collector.log
+          POLLING_TIMEOUT: "30"
+          MAX_RETRIES: "3"
+          BATCH_SAVE_SIZE: "50"
+          HEALTH_CHECK_INTERVAL: "300"
         run: |
           echo "🚀 Starting bot test (3 hours)..."
           echo "⏰ Start time: $(date)"
           echo "🤖 Bot will run until: $(date -d '+3 hours')"
           
-          # Run bot with timeout
+          # Create directories
+          mkdir -p telegram_data logs
+          
+          # Run bot with timeout (10800 seconds = 3 hours)
           timeout 10800 python bot.py poll || EXIT_CODE=$?
           
           echo "⏰ End time: $(date)"
           
-          # Exit code 124 means timeout (expected)
+          # Exit code 124 means timeout (expected after 3 hours)
           if [ $EXIT_CODE -eq 124 ]; then
             echo "✅ Bot ran for 3 hours successfully"
             exit 0
@@ -52,24 +68,27 @@ jobs:
             exit $EXIT_CODE
           fi
       
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-logs
-          path: |
-            logs/
-            telegram_data/
-          retention-days: 7
-      
       - name: Show statistics
         if: always()
         run: |
           if [ -f "telegram_data/collector.db" ]; then
             echo "📊 Final Statistics:"
+            echo "===================="
             sqlite3 telegram_data/collector.db "SELECT 'Total Updates: ' || COUNT(*) FROM updates;"
             sqlite3 telegram_data/collector.db "SELECT 'Total Users: ' || COUNT(*) FROM users;"
             sqlite3 telegram_data/collector.db "SELECT 'Total Chats: ' || COUNT(*) FROM chats;"
+            echo "===================="
           else
             echo "⚠️ No database found"
           fi
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_number }}
+          path: |
+            logs/
+            telegram_data/
+          retention-days: 7
+          if-no-files-found: warn
