@@ -1,66 +1,45 @@
-name: Test Bot (3 Hours)
+name: Telegram Bot
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  test-bot:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 180  # 3 ساعت
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
       - name: Install dependencies
         run: |
-          pip install python-dotenv requests
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
       
-      - name: Run bot for 3 hours
+      - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          AUTHORIZED_USERS: ${{ secrets.AUTHORIZED_USERS }}
         run: |
           echo "🚀 Starting bot test (3 hours)..."
           echo "⏰ Start time: $(date)"
-          
-          EXIT_CODE=0
-          timeout 10800 python bot.py || EXIT_CODE=$?
-          
+          python bot.py
           echo "⏰ End time: $(date)"
-          echo "Exit code: $EXIT_CODE"
-          
-          if [ $EXIT_CODE -eq 124 ]; then
-            echo "✅ Bot ran for 3 hours successfully"
-            exit 0
-          elif [ $EXIT_CODE -eq 0 ]; then
-            echo "✅ Bot completed successfully"
-            exit 0
-          else
-            echo "❌ Bot exited with code $EXIT_CODE"
-            exit $EXIT_CODE
-          fi
-      
-      - name: Show final stats
-        if: always()
-        run: |
-          if [ -f "telegram_data/collector.db" ]; then
-            echo "📊 Final Statistics:"
-            python bot.py stats
-          else
-            echo "⚠️ No database found"
-          fi
-      
-      - name: Upload data
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-data-${{ github.run_number }}
-          path: |
-            telegram_data/
-          retention-days: 7
-          if-no-files-found: warn
