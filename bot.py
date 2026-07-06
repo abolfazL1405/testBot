@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-🤖 Telegram Bot Intelligence Collector v4.0 - Production Server Edition
-Designed for headless server deployment with systemd/Docker support.
-"""
-
 import os
 import sys
 import json
@@ -25,44 +20,28 @@ from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
 @dataclass
 class Config:
-    """Application configuration"""
     bot_token: str
     data_dir: Path = Path("telegram_data")
     db_file: str = "collector.db"
     log_level: str = "INFO"
     log_file: str = "logs/collector.log"
-    log_max_bytes: int = 10 * 1024 * 1024  # 10MB
+    log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 5
     polling_timeout: int = 30
     max_retries: int = 3
     retry_delay: int = 5
     rate_limit_delay: float = 0.1
     batch_save_size: int = 50
-    health_check_interval: int = 300  # 5 minutes
+    health_check_interval: int = 300
     
     @classmethod
     def from_env(cls) -> 'Config':
-        """Load configuration from environment variables or .env file"""
         load_dotenv()
-        
-        # Try environment variable first (for GitHub Actions)
         token = os.getenv('TELEGRAM_BOT_TOKEN')
-        
-        # If not found, try to read from .env file
         if not token:
-            token = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
-        
-        if not token:
-            raise ValueError(
-                "TELEGRAM_BOT_TOKEN not found. "
-                "Set it as environment variable or in .env file"
-            )
+            raise ValueError("TELEGRAM_BOT_TOKEN not found")
         
         return cls(
             bot_token=token,
@@ -70,8 +49,6 @@ class Config:
             db_file=os.getenv('DB_FILE', 'collector.db'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
             log_file=os.getenv('LOG_FILE', 'logs/collector.log'),
-            log_max_bytes=int(os.getenv('LOG_MAX_BYTES', str(10 * 1024 * 1024))),
-            log_backup_count=int(os.getenv('LOG_BACKUP_COUNT', '5')),
             polling_timeout=int(os.getenv('POLLING_TIMEOUT', '30')),
             max_retries=int(os.getenv('MAX_RETRIES', '3')),
             batch_save_size=int(os.getenv('BATCH_SAVE_SIZE', '50')),
@@ -79,12 +56,7 @@ class Config:
         )
 
 
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-
 def setup_logging(config: Config) -> logging.Logger:
-    """Setup production logging with rotation"""
     from logging.handlers import RotatingFileHandler
     
     logger = logging.getLogger('telegram_collector')
@@ -95,12 +67,10 @@ def setup_logging(config: Config) -> logging.Logger:
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     
-    # File handler with rotation
     log_path = Path(config.log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -116,13 +86,7 @@ def setup_logging(config: Config) -> logging.Logger:
     return logger
 
 
-# ============================================================================
-# DATABASE MANAGER
-# ============================================================================
-
 class DatabaseManager:
-    """SQLite database manager for persistent storage"""
-    
     def __init__(self, db_path: Path, logger: logging.Logger):
         self.db_path = db_path
         self.logger = logger
@@ -130,7 +94,6 @@ class DatabaseManager:
         self._init_database()
     
     def _init_database(self):
-        """Initialize database schema"""
         with self._get_connection() as conn:
             conn.executescript('''
                 CREATE TABLE IF NOT EXISTS updates (
@@ -181,20 +144,13 @@ class DatabaseManager:
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 );
                 
-                CREATE TABLE IF NOT EXISTS stats (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                );
-                
                 CREATE INDEX IF NOT EXISTS idx_updates_timestamp ON updates(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
-                CREATE INDEX IF NOT EXISTS idx_chats_last_message ON chats(last_message);
             ''')
         self.logger.info(f"✅ Database initialized: {self.db_path}")
     
     @contextmanager
     def _get_connection(self):
-        """Get database connection with context management"""
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
@@ -208,7 +164,6 @@ class DatabaseManager:
             conn.close()
     
     def save_update(self, update: Dict):
-        """Save update to database"""
         update_id = update.get('update_id')
         update_type = self._get_update_type(update)
         
@@ -219,7 +174,6 @@ class DatabaseManager:
             )
     
     def save_user(self, user_data: Dict):
-        """Save or update user data"""
         user_id = user_data.get('user_id')
         
         with self._get_connection() as conn:
@@ -247,7 +201,6 @@ class DatabaseManager:
                 ''', (user_id, msg_type, count))
     
     def save_chat(self, chat_data: Dict):
-        """Save or update chat data"""
         chat_id = chat_data.get('chat_id')
         
         with self._get_connection() as conn:
@@ -275,13 +228,11 @@ class DatabaseManager:
                 ''', (chat_id, user_id))
     
     def get_last_update_id(self) -> int:
-        """Get last processed update ID"""
         with self._get_connection() as conn:
             result = conn.execute('SELECT MAX(update_id) FROM updates').fetchone()
             return result[0] if result[0] else 0
     
     def get_user(self, user_id: int) -> Optional[Dict]:
-        """Get user by ID"""
         with self._get_connection() as conn:
             row = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)).fetchone()
             if row:
@@ -295,7 +246,6 @@ class DatabaseManager:
         return None
     
     def get_chat(self, chat_id: int) -> Optional[Dict]:
-        """Get chat by ID"""
         with self._get_connection() as conn:
             row = conn.execute('SELECT * FROM chats WHERE chat_id = ?', (chat_id,)).fetchone()
             if row:
@@ -309,7 +259,6 @@ class DatabaseManager:
         return None
     
     def get_stats(self) -> Dict:
-        """Get collection statistics"""
         with self._get_connection() as conn:
             stats = {
                 'total_updates': conn.execute('SELECT COUNT(*) FROM updates').fetchone()[0],
@@ -320,7 +269,6 @@ class DatabaseManager:
         return stats
     
     def get_top_users(self, limit: int = 20) -> List[Dict]:
-        """Get top users by message count"""
         with self._get_connection() as conn:
             rows = conn.execute(
                 'SELECT * FROM users ORDER BY messages_count DESC LIMIT ?',
@@ -329,7 +277,6 @@ class DatabaseManager:
             return [dict(row) for row in rows]
     
     def get_top_chats(self, limit: int = 20) -> List[Dict]:
-        """Get top chats by message count"""
         with self._get_connection() as conn:
             rows = conn.execute(
                 'SELECT * FROM chats ORDER BY messages_count DESC LIMIT ?',
@@ -338,7 +285,6 @@ class DatabaseManager:
             return [dict(row) for row in rows]
     
     def _get_update_type(self, update: Dict) -> str:
-        """Determine update type"""
         if 'message' in update:
             return 'message'
         elif 'edited_message' in update:
@@ -350,13 +296,7 @@ class DatabaseManager:
         return 'unknown'
 
 
-# ============================================================================
-# TELEGRAM API CLIENT
-# ============================================================================
-
 class TelegramAPIClient:
-    """Robust Telegram API client with retry logic"""
-    
     def __init__(self, bot_token: str, config: Config, logger: logging.Logger):
         self.bot_token = bot_token
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
@@ -375,13 +315,11 @@ class TelegramAPIClient:
         self.session.mount("https://", adapter)
     
     def _api_call(self, method: str, params: Optional[Dict] = None) -> Dict:
-        """Make API call with error handling"""
         url = f"{self.base_url}/{method}"
         
         try:
             response = self.session.get(url, params=params, timeout=self.config.polling_timeout)
             response.raise_for_status()
-            
             data = response.json()
             
             if not data.get('ok'):
@@ -410,11 +348,9 @@ class TelegramAPIClient:
             return {'error': str(e)}
     
     def get_me(self) -> Dict:
-        """Get bot information"""
         return self._api_call('getMe')
     
     def get_updates(self, offset: Optional[int] = None, timeout: int = 30) -> List[Dict]:
-        """Get updates from Telegram"""
         params = {
             'timeout': timeout,
             'allowed_updates': ['message', 'edited_message', 'callback_query', 'channel_post']
@@ -426,13 +362,7 @@ class TelegramAPIClient:
         return result if isinstance(result, list) else []
 
 
-# ============================================================================
-# DATA PROCESSOR
-# ============================================================================
-
 class DataProcessor:
-    """Process and analyze Telegram data"""
-    
     def __init__(self, db: DatabaseManager, logger: logging.Logger):
         self.db = db
         self.logger = logger
@@ -440,7 +370,6 @@ class DataProcessor:
         self._chats_cache: Dict[int, Dict] = {}
     
     def process_update(self, update: Dict):
-        """Process a single update"""
         self.db.save_update(update)
         
         message = update.get('message') or update.get('edited_message')
@@ -456,7 +385,6 @@ class DataProcessor:
             self._process_message(channel_post)
     
     def _process_message(self, message: Dict):
-        """Process message data"""
         from_user = message.get('from', {})
         chat = message.get('chat', {})
         timestamp = datetime.fromtimestamp(message['date']).isoformat()
@@ -491,7 +419,6 @@ class DataProcessor:
             self._chats_cache[chat_id] = chat_data
     
     def _process_callback(self, callback: Dict):
-        """Process callback query"""
         from_user = callback.get('from', {})
         if from_user:
             user_id = from_user.get('id')
@@ -500,7 +427,6 @@ class DataProcessor:
                 self._users_cache[user_id]['last_seen'] = datetime.now().isoformat()
     
     def _get_or_create_user(self, user_id: int, user_data: Dict, timestamp: str) -> Dict:
-        """Get existing user or create new one"""
         if user_id in self._users_cache:
             return self._users_cache[user_id]
         
@@ -523,7 +449,6 @@ class DataProcessor:
         }
     
     def _get_or_create_chat(self, chat_id: int, chat_data: Dict, timestamp: str) -> Dict:
-        """Get existing chat or create new one"""
         if chat_id in self._chats_cache:
             return self._chats_cache[chat_id]
         
@@ -545,7 +470,6 @@ class DataProcessor:
         }
     
     def _get_message_type(self, message: Dict) -> str:
-        """Determine message type"""
         if 'text' in message:
             return 'text'
         elif 'photo' in message:
@@ -569,7 +493,6 @@ class DataProcessor:
         return 'other'
     
     def save_batch(self):
-        """Save cached data to database"""
         for user_data in self._users_cache.values():
             self.db.save_user(user_data)
         
@@ -582,13 +505,7 @@ class DataProcessor:
         self._chats_cache.clear()
 
 
-# ============================================================================
-# POLLING COLLECTOR (SERVER MODE)
-# ============================================================================
-
 class TelegramPollingCollector:
-    """Production-ready collector for server deployment"""
-    
     def __init__(self, config: Config):
         self.config = config
         self.logger = setup_logging(config)
@@ -601,17 +518,14 @@ class TelegramPollingCollector:
         self._setup_signal_handlers()
     
     def _setup_signal_handlers(self):
-        """Setup graceful shutdown handlers"""
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
         self.logger.info(f"\n⚠️  Received signal {signum}, shutting down gracefully...")
         self.running = False
     
     def _health_check(self):
-        """Perform periodic health check"""
         current_time = time.time()
         if current_time - self.last_health_check >= self.config.health_check_interval:
             stats = self.db.get_stats()
@@ -622,7 +536,6 @@ class TelegramPollingCollector:
             self.last_health_check = current_time
     
     def start_polling(self):
-        """Start polling loop (server mode)"""
         self.logger.info("=" * 70)
         self.logger.info("🚀 Starting Telegram Polling Collector v4.0 - Server Mode")
         self.logger.info("=" * 70)
@@ -677,7 +590,6 @@ class TelegramPollingCollector:
         return True
     
     def _print_stats(self):
-        """Print collection statistics"""
         stats = self.db.get_stats()
         
         self.logger.info("\n" + "=" * 70)
@@ -689,203 +601,12 @@ class TelegramPollingCollector:
         self.logger.info(f"  🔢 Last update ID: {stats['last_update_id']}")
 
 
-# ============================================================================
-# EXPORT MANAGER
-# ============================================================================
-
-class ExportManager:
-    """Export data to various formats"""
-    
-    def __init__(self, db: DatabaseManager, logger: logging.Logger):
-        self.db = db
-        self.logger = logger
-    
-    def export_json(self, output_file: str):
-        """Export to JSON format"""
-        report = {
-            '_metadata': {
-                'version': '4.0',
-                'timestamp': datetime.now().isoformat(),
-                'collector': 'TelegramPollingCollector',
-            },
-            'stats': self.db.get_stats(),
-            'top_users': self.db.get_top_users(50),
-            'top_chats': self.db.get_top_chats(50),
-        }
-        
-        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-        
-        self.logger.info(f"💾 JSON report saved: {output_file}")
-    
-    def export_csv(self, output_dir: str):
-        """Export to CSV format"""
-        import csv
-        
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        
-        users_file = Path(output_dir) / 'users.csv'
-        with open(users_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                'user_id', 'first_name', 'last_name', 'username', 
-                'language_code', 'is_premium', 'messages_count', 
-                'first_seen', 'last_seen'
-            ])
-            writer.writeheader()
-            for user in self.db.get_top_users(10000):
-                writer.writerow(user)
-        
-        chats_file = Path(output_dir) / 'chats.csv'
-        with open(chats_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                'chat_id', 'chat_type', 'title', 'username',
-                'first_name', 'last_name', 'messages_count',
-                'first_message', 'last_message'
-            ])
-            writer.writeheader()
-            for chat in self.db.get_top_chats(10000):
-                writer.writerow(chat)
-        
-        self.logger.info(f"💾 CSV files saved to: {output_dir}")
-
-
-# ============================================================================
-# CLI INTERFACE
-# ============================================================================
-
-def create_parser() -> argparse.ArgumentParser:
-    """Create command-line argument parser"""
-    parser = argparse.ArgumentParser(
-        description='Telegram Bot Intelligence Collector v4.0 - Server Edition',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  %(prog)s poll                    Start polling mode (server)
-  %(prog)s stats                   Show collection statistics
-  %(prog)s user <user_id>          Search user by ID
-  %(prog)s chat <chat_id>          Search chat by ID
-  %(prog)s export --format json    Export data to JSON
-        '''
-    )
-    
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    # Poll command
-    poll_parser = subparsers.add_parser('poll', help='Start polling mode (server)')
-    
-    # Stats command
-    stats_parser = subparsers.add_parser('stats', help='Show statistics')
-    
-    # User command
-    user_parser = subparsers.add_parser('user', help='Search user')
-    user_parser.add_argument('user_id', type=int, help='User ID')
-    
-    # Chat command
-    chat_parser = subparsers.add_parser('chat', help='Search chat')
-    chat_parser.add_argument('chat_id', type=int, help='Chat ID')
-    
-    # Export command
-    export_parser = subparsers.add_parser('export', help='Export data')
-    export_parser.add_argument('--format', choices=['json', 'csv', 'all'], default='json')
-    export_parser.add_argument('--output', help='Output file/directory')
-    
-    return parser
-
-
 def main():
-    """Main entry point"""
-    parser = create_parser()
-    args = parser.parse_args()
-    
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-    
     try:
-        # Load configuration from .env
         config = Config.from_env()
-        
-        if args.command == 'poll':
-            collector = TelegramPollingCollector(config)
-            success = collector.start_polling()
-            sys.exit(0 if success else 1)
-        
-        elif args.command == 'stats':
-            logger = setup_logging(config)
-            db = DatabaseManager(config.data_dir / config.db_file, logger)
-            stats = db.get_stats()
-            
-            print("\n" + "=" * 70)
-            print("📊 Collection Statistics:")
-            print("=" * 70)
-            print(f"  📥 Total updates: {stats['total_updates']}")
-            print(f"  👥 Total users: {stats['total_users']}")
-            print(f"  💬 Total chats: {stats['total_chats']}")
-            print(f"  🔢 Last update ID: {stats['last_update_id']}")
-            
-            print("\n🏆 Top Users:")
-            for i, user in enumerate(db.get_top_users(10), 1):
-                print(f"  {i}. {user.get('first_name')} (ID: {user.get('user_id')}) - {user.get('messages_count')} messages")
-        
-        elif args.command == 'user':
-            logger = setup_logging(config)
-            db = DatabaseManager(config.data_dir / config.db_file, logger)
-            user = db.get_user(args.user_id)
-            
-            if user:
-                print("\n" + "=" * 70)
-                print(f"👤 User {args.user_id}:")
-                print("=" * 70)
-                print(f"  • Name: {user.get('first_name')} {user.get('last_name', '')}")
-                print(f"  • Username: @{user.get('username', 'N/A')}")
-                print(f"  • Messages: {user.get('messages_count', 0)}")
-                print(f"  • First seen: {user.get('first_seen', 'N/A')}")
-                print(f"  • Last seen: {user.get('last_seen', 'N/A')}")
-                print(f"  • Premium: {user.get('is_premium', False)}")
-                print(f"  • Language: {user.get('language_code', 'N/A')}")
-                if user.get('message_types'):
-                    print(f"  • Message types: {user.get('message_types')}")
-            else:
-                print(f"❌ User {args.user_id} not found")
-        
-        elif args.command == 'chat':
-            logger = setup_logging(config)
-            db = DatabaseManager(config.data_dir / config.db_file, logger)
-            chat = db.get_chat(args.chat_id)
-            
-            if chat:
-                print("\n" + "=" * 70)
-                print(f"💬 Chat {args.chat_id}:")
-                print("=" * 70)
-                print(f"  • Title: {chat.get('title') or chat.get('first_name', 'N/A')}")
-                print(f"  • Type: {chat.get('chat_type', 'N/A')}")
-                print(f"  • Username: @{chat.get('username', 'N/A')}")
-                print(f"  • Messages: {chat.get('messages_count', 0)}")
-                print(f"  • First message: {chat.get('first_message', 'N/A')}")
-                print(f"  • Last message: {chat.get('last_message', 'N/A')}")
-                print(f"  • Active users: {len(chat.get('active_users', []))}")
-            else:
-                print(f"❌ Chat {args.chat_id} not found")
-        
-        elif args.command == 'export':
-            logger = setup_logging(config)
-            db = DatabaseManager(config.data_dir / config.db_file, logger)
-            exporter = ExportManager(db, logger)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            if args.format in ['json', 'all']:
-                output = args.output or f"exports/telegram_report_{timestamp}.json"
-                exporter.export_json(output)
-            
-            if args.format in ['csv', 'all']:
-                output_dir = args.output or f"exports/telegram_export_{timestamp}"
-                exporter.export_csv(output_dir)
-            
-            print("✅ Export completed!")
-    
+        collector = TelegramPollingCollector(config)
+        success = collector.start_polling()
+        sys.exit(0 if success else 1)
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
