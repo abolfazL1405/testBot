@@ -25,20 +25,15 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          echo "🚀 Starting simple bot test (3 hours)..."
+          echo "🚀 Starting bot test (3 hours)..."
           echo "⏰ Start time: $(date)"
-          echo " Bot will run until: $(date -d '+3 hours')"
           
-          # Initialize EXIT_CODE
           EXIT_CODE=0
-          
-          # Run bot with timeout (10800 seconds = 3 hours)
           timeout 10800 python bot.py || EXIT_CODE=$?
           
           echo "⏰ End time: $(date)"
           echo "Exit code: $EXIT_CODE"
           
-          # Exit code 124 means timeout (expected after 3 hours)
           if [ $EXIT_CODE -eq 124 ]; then
             echo "✅ Bot ran for 3 hours successfully"
             exit 0
@@ -49,3 +44,23 @@ jobs:
             echo "❌ Bot exited with code $EXIT_CODE"
             exit $EXIT_CODE
           fi
+      
+      - name: Show final stats
+        if: always()
+        run: |
+          if [ -f "telegram_data/collector.db" ]; then
+            echo "📊 Final Statistics:"
+            python bot.py stats
+          else
+            echo "⚠️ No database found"
+          fi
+      
+      - name: Upload data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-data-${{ github.run_number }}
+          path: |
+            telegram_data/
+          retention-days: 7
+          if-no-files-found: warn
